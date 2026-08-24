@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+title: >-
+  Differential Evolution Optimised Deep Neural Network for
+  Network Intrusion Detection
+message: If you use this software, please cite it as below.
+type: software
+authors:
+  - given-names: Florish
+    family-names: Adekogbe
+    email: florishadekogbe@gmail.com
+    affiliation: University of Lagos
+repository-code: 'https://github.com/von-moyo/de-dnn-ids'
+abstract: >-
+  A hand-implemented DE/rand/1/bin differential evolution optimiser that
+  searches the architecture and training hyperparameters of a deep neural
+  network for network intrusion detection on the CSE-CIC-IDS2018 dataset,
+  using validation macro-F1 as the fitness signal so that rare attack
+  classes are not ignored.
+keywords:
+  - intrusion detection
+  - differential evolution
+  - hyperparameter optimisation
+  - deep neural network
+  - CSE-CIC-IDS2018
+license: MIT

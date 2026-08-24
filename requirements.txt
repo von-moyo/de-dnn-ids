@@ -1,0 +1,15 @@
+# Core
+numpy>=1.24,<2.1
+pandas>=2.0
+scikit-learn>=1.3
+
+# Deep learning. TensorFlow 2.11+ has no native GPU support on Windows --
+# use WSL2 or Google Colab for GPU acceleration.
+tensorflow>=2.13,<2.17
+
+# Class balancing (optional; the pipeline degrades gracefully without it)
+imbalanced-learn>=0.11
+
+# Figures
+matplotlib>=3.7
+seaborn>=0.12
