@@ -60,8 +60,8 @@ import json
 import random
 import argparse
 import warnings
-import numpy as np
-import pandas as pd
+import numpy as np # type: ignore
+import pandas as pd # type: ignore
 
 warnings.filterwarnings("ignore")
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -102,8 +102,32 @@ def set_seeds(seed=42):
 # -----------------------------------------------------------------------------
 # 1. DATA LOADING AND PREPROCESSING
 # -----------------------------------------------------------------------------
+def read_capture_file(path):
+    """Read one capture file. Supports .csv, .parquet, and zipped parquet.
+
+    The raw CIC release ships CSVs; the widely used cleaned redistributions
+    (e.g. dhoogla/csecicids2018 on Kaggle) ship parquet, sometimes zipped.
+    """
+    low = path.lower()
+    if low.endswith(".csv"):
+        return pd.read_csv(path, low_memory=False)
+    if low.endswith(".parquet"):
+        return pd.read_parquet(path)
+    if low.endswith(".zip"):
+        import zipfile, io
+        with zipfile.ZipFile(path) as z:
+            inner = [n for n in z.namelist()
+                     if n.lower().endswith((".parquet", ".csv"))]
+            if not inner:
+                raise ValueError(f"{path} contains no .parquet or .csv member")
+            buf = io.BytesIO(z.read(inner[0]))
+        return (pd.read_parquet(buf) if inner[0].lower().endswith(".parquet")
+                else pd.read_csv(buf, low_memory=False))
+    raise ValueError(f"unsupported file type: {path}")
+
+
 def load_and_preprocess(data_dir, mode="multiclass", sample_frac=1.0,
-                        use_smote=False, random_state=42):
+                        use_smote=False, random_state=42, max_per_class=None):
     """Load CSE-CIC-IDS2018 CSVs and return train/val/test splits.
 
     The CIC flow CSVs share the same 80-column schema. We concatenate every
@@ -111,14 +135,20 @@ def load_and_preprocess(data_dir, mode="multiclass", sample_frac=1.0,
     repair the infinite / missing values the dataset is notorious for, encode
     the Label column, split 60/20/20, then scale using training statistics only.
     """
-    csv_files = sorted(os.path.join(data_dir, f) for f in os.listdir(data_dir)
-                       if f.lower().endswith(".csv"))
-    if not csv_files:
-        raise FileNotFoundError(f"No CSV files found in {data_dir}")
+    found = [os.path.join(data_dir, f) for f in sorted(os.listdir(data_dir))
+             if f.lower().endswith((".csv", ".parquet", ".zip"))]
+    # If an archive has already been extracted alongside itself, read the
+    # extracted copy and skip the archive rather than loading both.
+    plain = {f for f in found if not f.lower().endswith(".zip")}
+    data_files = [f for f in found
+                  if not (f.lower().endswith(".zip") and f[:-4] in plain)]
+    if not data_files:
+        raise FileNotFoundError(
+            f"No .csv, .parquet or .zip files found in {data_dir}")
 
     frames = []
-    for f in csv_files:
-        df = pd.read_csv(f, low_memory=False)
+    for f in data_files:
+        df = read_capture_file(f)
         if sample_frac < 1.0:
             # Sample per file so no capture day (and therefore no attack
             # family) can be dropped entirely by the subsample.
@@ -145,8 +175,19 @@ def load_and_preprocess(data_dir, mode="multiclass", sample_frac=1.0,
     # Repair inf / NaN: CIC flow features such as "Flow Bytes/s" divide by a
     # duration that can be zero, and some CSVs embed a repeated header row.
     feature_cols = [c for c in data.columns if c != label_col]
-    data[feature_cols] = data[feature_cols].apply(pd.to_numeric, errors="coerce")
-    data[feature_cols] = data[feature_cols].replace([np.inf, -np.inf], np.nan)
+    # Only coerce columns that are not already numeric. Cleaned parquet builds
+    # arrive correctly typed (int8/int16/float32); blanket to_numeric would
+    # upcast every column to float64 and roughly triple peak memory.
+    non_numeric = [c for c in feature_cols
+                   if not pd.api.types.is_numeric_dtype(data[c])]
+    if non_numeric:
+        print(f"[data] coercing {len(non_numeric)} non-numeric feature columns")
+        data[non_numeric] = data[non_numeric].apply(pd.to_numeric,
+                                                    errors="coerce")
+    float_cols = [c for c in feature_cols
+                  if pd.api.types.is_float_dtype(data[c])]
+    if float_cols:
+        data[float_cols] = data[float_cols].replace([np.inf, -np.inf], np.nan)
     before = len(data)
     data = data.dropna()
     print(f"[data] dropped {before - len(data):,} rows containing inf/NaN "
@@ -160,6 +201,21 @@ def load_and_preprocess(data_dir, mode="multiclass", sample_frac=1.0,
               f"{constant_cols}")
     data = data.drop(columns=constant_cols, errors="ignore")
     feature_cols = [c for c in data.columns if c != label_col]
+
+    # Class-aware cap. Unlike --sample_frac, which thins every class equally
+    # and wipes out the tiny web-attack families, this keeps every row of a
+    # rare class and only subsamples classes above the cap. That is what makes
+    # macro-F1 meaningful while keeping the DE search affordable.
+    if max_per_class:
+        before = len(data)
+        # Iterate the groups rather than using .apply: pandas 2.x drops the
+        # grouping column from the frames handed to .apply.
+        parts = [g.sample(n=min(len(g), max_per_class),
+                          random_state=random_state)
+                 for _, g in data.groupby(label_col, observed=True)]
+        data = pd.concat(parts).sample(frac=1.0, random_state=random_state)
+        print(f"[data] capped classes at {max_per_class:,}/class: "
+              f"{before:,} -> {len(data):,} rows")
 
     # Binary vs multi-class target.
     y_raw = data[label_col].astype(str).str.strip()
@@ -339,6 +395,15 @@ def differential_evolution(fitness_fn, dim=6, pop_size=20, generations=50,
     Returns the best vector, its fitness, and the per-generation best-fitness
     history (for the convergence plot).
     """
+    # DE/rand/1 draws three donors distinct from the target, so a population
+    # below 4 cannot form a mutation vector at all.
+    if pop_size < 4:
+        raise ValueError(
+            f"pop_size must be >= 4 for DE/rand/1 (got {pop_size}); the "
+            f"mutation needs three donors distinct from the target. "
+            f"Guidance is roughly 10x the dimensionality, i.e. ~60 here, "
+            f"with 20 a reasonable compromise.")
+
     rng = np.random.default_rng(seed)
     pop = rng.random((pop_size, dim))
     scores = np.array([fitness_fn(ind) for ind in pop])
@@ -512,7 +577,13 @@ def main():
     ap.add_argument("--mode", choices=["binary", "multiclass"],
                     default="multiclass")
     ap.add_argument("--sample_frac", type=float, default=1.0,
-                    help="stratified per-file subsample, e.g. 0.05 for 5%%")
+                    help="per-file random subsample, e.g. 0.05 for 5%%. Thins "
+                         "every class equally, so it starves rare attacks -- "
+                         "prefer --max_per_class")
+    ap.add_argument("--max_per_class", type=int, default=None,
+                    help="cap each class at N rows, keeping ALL rows of any "
+                         "class smaller than N. The right knob for this "
+                         "dataset, e.g. --max_per_class 50000")
     ap.add_argument("--use_smote", action="store_true",
                     help="oversample minority classes in the training split")
     ap.add_argument("--pop_size", type=int, default=20)
@@ -532,7 +603,8 @@ def main():
 
     (X_train, y_train, X_val, y_val, X_test, y_test,
      n_classes, class_names) = load_and_preprocess(
-        args.data_dir, args.mode, args.sample_frac, args.use_smote, args.seed)
+        args.data_dir, args.mode, args.sample_frac, args.use_smote, args.seed,
+        max_per_class=args.max_per_class)
 
     from tensorflow import keras
 
