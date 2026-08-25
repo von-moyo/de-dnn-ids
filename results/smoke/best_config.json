@@ -1,0 +1,38 @@
+{
+  "hyperparameters": {
+    "n_layers": 4,
+    "neurons": 427,
+    "lr": 0.002139156686698869,
+    "dropout": 0.11361936089238844,
+    "batch": 64,
+    "activation": "relu"
+  },
+  "vector": [
+    0.6438651200806645,
+    0.82276161327083,
+    0.44341419882733113,
+    0.2272387217847769,
+    0.5545847870158348,
+    0.06381725610417532
+  ],
+  "validation_macro_f1": 0.9024745565483195,
+  "convergence_history": [
+    0.9024745565483195,
+    0.9024745565483195
+  ],
+  "settings": {
+    "data_dir": ".\\data",
+    "out_dir": ".\\results\\smoke",
+    "mode": "multiclass",
+    "sample_frac": 1.0,
+    "max_per_class": 2000,
+    "min_class_rows": 200,
+    "use_smote": false,
+    "pop_size": 4,
+    "generations": 1,
+    "fitness_epochs": 3,
+    "final_epochs": 5,
+    "seed": 42,
+    "load_config": null
+  }
+}

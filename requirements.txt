@@ -3,6 +3,11 @@ numpy>=1.24,<2.1
 pandas>=2.0
 scikit-learn>=1.3
 
+# Parquet engine. The raw CIC release is CSV, but the cleaned redistributions
+# (e.g. dhoogla/csecicids2018) ship parquet, which read_capture_file() reads
+# via pandas -- and pandas has no built-in parquet engine.
+pyarrow>=14.0
+
 # Deep learning. Keras 3 (bundled with TensorFlow >= 2.16) is what this code
 # targets; it also runs on the tf.keras of 2.13-2.15. No upper pin, because
 # TF 2.13-2.16 have no wheels for Python 3.13+.

@@ -35,8 +35,8 @@ search space is hostile to gradient methods:
 | Expensive to evaluate | Each fitness call is a full network training run |
 
 The second design decision matters as much as the first: fitness is **macro-F1,
-not accuracy**. CSE-CIC-IDS2018 is ~83% benign traffic, so a model that predicts
-"Benign" for every flow scores ~83% accuracy while detecting nothing. Macro-F1
+not accuracy**. CSE-CIC-IDS2018 is 80% benign traffic, so a model that predicts
+"Benign" for every flow scores 80% accuracy while detecting nothing. Macro-F1
 weights every class equally, forcing the search to care about rare attack
 families — which are precisely the ones a real adversary uses.
 
@@ -46,8 +46,9 @@ families — which are precisely the ones a real adversary uses.
 
 ```mermaid
 flowchart TD
-    A[10 daily CSVs<br/>~16M flow records] --> B[Clean<br/>drop identity cols · repair inf/NaN<br/>drop zero-variance cols]
-    B --> C[Stratified split<br/>60 / 20 / 20]
+    A[10 daily captures<br/>6.7M flows · 15 classes] --> B[Clean<br/>drop identity cols · repair inf/NaN<br/>drop zero-variance cols]
+    B --> B2[Class-aware cap<br/>drop unscoreable classes]
+    B2 --> C[Stratified split<br/>60 / 20 / 20]
     C --> D[MinMax scale<br/>fitted on TRAIN only]
     D --> E{Optional SMOTE<br/>train split only}
     E --> F[["DE/rand/1/bin<br/>mutate → crossover → select"]]
@@ -159,6 +160,51 @@ failure at the reporting stage.
 
 ---
 
+## Dataset build matters
+
+CSE-CIC-IDS2018 circulates in two incompatible forms, and **which one you use
+changes your results more than any hyperparameter DE will find.**
+
+| | Raw CIC release (CSV) | Cleaned redistribution (parquet) |
+|---|---|---|
+| Source | [CIC](https://www.unb.ca/cic/datasets/ids-2018.html), AWS S3, `solarmainframe/ids-intrusion-csv` | `dhoogla/csecicids2018` |
+| Rows | ~16,000,000 | **6,659,532** |
+| Columns | 80 | **78** |
+| `Dst Port` | present | **absent** |
+| `Timestamp` | present | absent |
+| Duplicate rows | many | **0** |
+| `Infinity` / NaN | present | already repaired |
+
+The pipeline reads both. The numbers in this README come from the **cleaned
+parquet** build.
+
+**Deduplication is the consequential difference.** Removing duplicate flows
+collapses several attack families to a handful of distinct feature vectors:
+
+| Class | Raw | Deduplicated |
+|---|---:|---:|
+| FTP-BruteForce | ~193,000 | **53** |
+| DoS attacks-SlowHTTPTest | ~140,000 | **55** |
+| SQL Injection | ~87 | 85 |
+
+Those rows were never independent evidence — they were the same flow repeated.
+But the consequence is that at a 20% test split these classes get ~10 test rows
+each, too few to score and pure noise inside the macro-F1 that DE optimises.
+`--min_class_rows 200` removes exactly those three, leaving 12 scoreable classes.
+
+**This affects how you compare against published work.** Nearly all published
+CSE-CIC-IDS2018 results use the raw build, where duplicated flows appear in both
+the train and test splits — the model memorises rather than generalises, and the
+reported figures are inflated. Results on the deduplicated build are **lower and
+not directly comparable**. State which build you used; a reader comparing a
+deduplicated macro-F1 against a raw-build table will misread it as
+underperformance.
+
+Do not mix the two, or fill gaps in one from the other: half a corpus
+deduplicated and half not means preprocessing differs by capture day.
+
+---
+
 ## Installation
 
 ```bash
@@ -182,36 +228,48 @@ Then fetch the dataset into `data/` — see [`data/README.md`](data/README.md).
 ## Usage
 
 ```bash
-# Full experiment (multi-class, 9+ attack families)
-python de_dnn_ids.py --data_dir ./data --mode multiclass
+# Multi-class over every attack family, class-capped so the search is affordable
+python de_dnn_ids.py --data_dir ./data --mode multiclass --max_per_class 20000
 
 # Binary detection: benign vs attack
-python de_dnn_ids.py --data_dir ./data --mode binary
+python de_dnn_ids.py --data_dir ./data --mode binary --max_per_class 200000
 
-# Fast development run on a 5% subsample with a small search budget
-python de_dnn_ids.py --sample_frac 0.05 --pop_size 6 --generations 5
+# Fast smoke test — exercises the whole pipeline in a few minutes
+python de_dnn_ids.py --mode binary --max_per_class 2000 \
+    --pop_size 4 --generations 1 --fitness_epochs 3 --final_epochs 5
 
 # Balance rare classes with SMOTE (training split only)
 python de_dnn_ids.py --use_smote
 ```
 
+`--pop_size 4` is the floor: DE/rand/1 needs three donor vectors distinct from
+the target, so a smaller population cannot form a mutation at all.
+
 ### Recommended two-stage protocol
 
 The default budget is `pop_size × (1 + generations) = 1,020` full network
-trainings. On the complete 16M-flow dataset that is not feasible. Run the search
-cheaply, then retrain the winner at full scale:
+trainings — days of compute on CPU, and not feasible at any realistic data size.
+Search cheaply, then retrain the winner larger:
 
 ```bash
-# Stage 1 — search on a subsample (hours)
-python de_dnn_ids.py --sample_frac 0.05 --pop_size 20 --generations 50
+# Stage 1 — search on a class-capped subset (5–8 h on CPU)
+python de_dnn_ids.py --out_dir results/stage1 \
+    --max_per_class 20000 --min_class_rows 200 \
+    --pop_size 10 --generations 10 --fitness_epochs 8
 
-# Stage 2 — retrain the winning configuration on everything (once)
-python de_dnn_ids.py --sample_frac 1.0 --load_config results/best_config.json
+# Stage 2 — retrain the winning configuration once, on 10× the data (1–2 h)
+python de_dnn_ids.py --out_dir results/final \
+    --max_per_class 200000 --min_class_rows 200 \
+    --load_config results/stage1/best_config.json
 ```
 
 This is a standard **fidelity-reduction** strategy: DE converges on the *relative
 ranking* of hyperparameters, and that ranking is largely stable across sample
 sizes even though absolute scores are not.
+
+> `--load_config` skips only the **search**. Data flags are not replayed from the
+> saved config, so stage 2 must repeat `--max_per_class` and `--min_class_rows`
+> — otherwise it evaluates a different class set than the one DE tuned for.
 
 ### Arguments
 
@@ -220,7 +278,9 @@ sizes even though absolute scores are not.
 | `--data_dir` | `./data` | Directory containing the CSE-CIC-IDS2018 CSVs |
 | `--out_dir` | `./results` | Where figures, metrics and the model are written |
 | `--mode` | `multiclass` | `binary` or `multiclass` |
-| `--sample_frac` | `1.0` | Stratified per-file subsample, e.g. `0.05` |
+| `--sample_frac` | `1.0` | Stratified per-file subsample, e.g. `0.05`. Thins every class equally, so it starves rare attacks — prefer `--max_per_class` |
+| `--max_per_class` | — | Cap each class at N rows, keeping **all** rows of any class below N. "Class" follows `--mode`: attack family in multiclass, Benign/Attack in binary |
+| `--min_class_rows` | `0` (off) | Drop classes with fewer than N rows corpus-wide. `200` removes the three that deduplication left unscoreable |
 | `--use_smote` | off | Oversample minority classes in the training split |
 | `--pop_size` | `20` | DE population size |
 | `--generations` | `50` | DE generations |
@@ -257,7 +317,10 @@ Concretely:
   launched from a fixed set of hosts during known windows, so a model that keeps
   them learns *"traffic from 18.219.211.138 is malicious"* rather than what an
   attack looks like — near-perfect on paper, useless in production. `Dst Port` is
-  deliberately **kept**: it is genuine protocol signal.
+  deliberately **kept** where it exists: it is genuine protocol signal.
+  ⚠️ The cleaned parquet build drops `Dst Port` and `Timestamp` upstream, so on
+  that build the model trains **without port information at all**. See
+  [Dataset build](#dataset-build-matters).
 - **The scaler is fitted on the training split only.** Splitting happens *before*
   scaling, and validation and test are transformed with training statistics.
 - **SMOTE runs after the split, on training data only.** Applied beforehand it
@@ -278,6 +341,23 @@ them — this is *alert fatigue*, and it is the documented reason the 2013 Targe
 breach went unactioned despite the IDS firing correctly. A model with 99% accuracy
 and 2% FPR is operationally worse than one with 97% accuracy and 0.1% FPR.
 
+Two false-positive figures are reported, and the distinction matters:
+
+| Metric | Meaning |
+|---|---|
+| `fpr` | Macro one-vs-rest FPR, averaged over **all** classes |
+| `benign_false_alarm_rate` | Of genuinely benign flows, the fraction flagged as **some** attack |
+
+`fpr` is diluted in multiclass mode: a dozen easy attack classes with near-zero
+false positives average it down to ~0.007 even when most benign traffic is being
+misclassified. `benign_false_alarm_rate` is the one the alert-fatigue argument is
+about — **quote that one operationally.**
+
+**Benign vs Infiltration is the hard case.** `Infilteration` is near-
+indistinguishable from normal traffic in this dataset, and the model reliably
+confuses the two in both directions. Expect this to dominate your error budget;
+it is a known property of CSE-CIC-IDS2018 rather than a defect in the pipeline.
+
 **Robustness choices.** A candidate that fails to train (typically an
 out-of-memory configuration such as 5 × 512 neurons at batch 16) scores 0.0 rather
 than aborting the search, so a multi-hour run is not lost to one bad individual.
@@ -288,12 +368,17 @@ global graph accumulating across ~1,000 evaluations.
 
 ## Known limitations
 
-- **Peak memory.** All CSVs are concatenated into one DataFrame before cleaning.
-  At `--sample_frac 1.0` this needs roughly 10–12 GB of RAM. Use `--sample_frac`
-  or clean per-file if that is a constraint.
-- **Rare-class support.** Subsampling starves `SQL Injection` and
-  `Brute Force -XSS`. Consider a class-aware sample that keeps 100% of rare
-  classes and subsamples only Benign and the large attack families.
+- **Peak memory.** All captures are concatenated into one DataFrame before
+  cleaning. With `--max_per_class` each file is pre-capped during the load loop,
+  which bounds this; without it, the full corpus is resident at once and needs
+  roughly 10–12 GB on the raw CSVs.
+- **Rare-class support.** Three classes cannot be scored on the deduplicated
+  build at any sample size — see [Dataset build](#dataset-build-matters).
+- **Class-balanced metrics.** `--max_per_class` rebalances the test set, so
+  reported `accuracy` and `fpr` are measured on that mix rather than on real
+  traffic's ~80% benign prior. Macro precision/recall/F1 weight classes equally
+  and are unaffected. The caveat is written into `metrics.json` under
+  `_sampling` on every capped run.
 - **DE cost.** Fitness evaluation is a full training run. Multi-fidelity methods
   (Hyperband, successive halving) would reach a comparable configuration for less
   compute — at the cost of the clean, interpretable DE convergence curve.

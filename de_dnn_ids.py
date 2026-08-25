@@ -37,21 +37,32 @@
 
  HOW TO RUN ON THE REAL DATA
  ---------------------------
-   - Download CSE-CIC-IDS2018 (the 10 daily CSVs) into ./data/
+   - Put the 10 daily capture files in ./data/ (see data/README.md)
    - pip install -r requirements.txt
-   - python de_dnn_ids.py --data_dir ./data --mode multiclass
-   A GPU is strongly recommended; on Google Colab set Runtime -> GPU.
+   - python de_dnn_ids.py --data_dir ./data --mode multiclass --max_per_class 20000
+   A GPU is strongly recommended; on Google Colab set Runtime -> GPU. Native
+   Windows cannot use a GPU at all on TensorFlow >= 2.11.
 
  NOTE ON SCALE
  -------------
- The full CSE-CIC-IDS2018 dataset is ~16 million flows, and the default search
- budget is pop_size * (1 + generations) = 1,020 full network trainings. Run the
- search on a stratified subset first, then retrain the winner on everything:
+ The raw CIC release is ~16 million flows; the deduplicated parquet build is
+ ~6.7 million. Either way the default search budget of
+ pop_size * (1 + generations) = 1,020 full network trainings is out of reach on
+ CPU. Search on a class-capped subset, then retrain the winner larger:
 
-   # stage 1 - search (cheap)
-   python de_dnn_ids.py --sample_frac 0.05 --pop_size 15 --generations 10
-   # stage 2 - final model on the full data, reusing the winning config
-   python de_dnn_ids.py --sample_frac 1.0 --load_config results/best_config.json
+   # stage 1 - search (hours)
+   python de_dnn_ids.py --out_dir results/stage1 --max_per_class 20000 \
+       --min_class_rows 200 --pop_size 10 --generations 10 --fitness_epochs 8
+   # stage 2 - final model, reusing the winning config
+   python de_dnn_ids.py --out_dir results/final --max_per_class 200000 \
+       --min_class_rows 200 --load_config results/stage1/best_config.json
+
+ --load_config skips only the SEARCH. The data flags are not replayed from the
+ saved config, so stage 2 must repeat --max_per_class and --min_class_rows or
+ it will silently evaluate a different class set than the one DE tuned for.
+
+ Prefer --max_per_class over --sample_frac: the latter thins every class
+ equally and starves the rare attack families that macro-F1 depends on.
 ================================================================================
 """
 
@@ -102,12 +113,8 @@ def set_seeds(seed=42):
 # -----------------------------------------------------------------------------
 # 1. DATA LOADING AND PREPROCESSING
 # -----------------------------------------------------------------------------
-def read_capture_file(path):
-    """Read one capture file. Supports .csv, .parquet, and zipped parquet.
-
-    The raw CIC release ships CSVs; the widely used cleaned redistributions
-    (e.g. dhoogla/csecicids2018 on Kaggle) ship parquet, sometimes zipped.
-    """
+def _read_one(path):
+    """Single read attempt, dispatching on extension."""
     low = path.lower()
     if low.endswith(".csv"):
         return pd.read_csv(path, low_memory=False)
@@ -126,14 +133,69 @@ def read_capture_file(path):
     raise ValueError(f"unsupported file type: {path}")
 
 
-def load_and_preprocess(data_dir, mode="multiclass", sample_frac=1.0,
-                        use_smote=False, random_state=42, max_per_class=None):
-    """Load CSE-CIC-IDS2018 CSVs and return train/val/test splits.
+def read_capture_file(path, retries=4, backoff=3.0):
+    """Read one capture file. Supports .csv, .parquet, and zipped parquet.
 
-    The CIC flow CSVs share the same 80-column schema. We concatenate every
-    CSV in `data_dir`, drop the columns that leak identity or are constant,
-    repair the infinite / missing values the dataset is notorious for, encode
-    the Label column, split 60/20/20, then scale using training statistics only.
+    The raw CIC release ships CSVs; the widely used cleaned redistributions
+    (e.g. dhoogla/csecicids2018 on Kaggle) ship parquet, sometimes zipped.
+
+    Reads are retried because on Windows an on-access antivirus scan can hold a
+    transient lock on a file this large and surface it as PermissionError. That
+    is worth surviving rather than crashing: every invocation re-reads all ten
+    captures, so an unretried lock can kill a DE search hours after it started.
+    """
+    import time
+    for attempt in range(retries):
+        try:
+            return _read_one(path)
+        except PermissionError:
+            if attempt == retries - 1:
+                raise
+            wait = backoff * (attempt + 1)
+            print(f"[warn] {os.path.basename(path)} locked "
+                  f"(attempt {attempt + 1}/{retries}); retrying in {wait:.0f}s")
+            time.sleep(wait)
+
+
+def class_key(df, label_col, mode):
+    """The label the MODEL actually learns, as a Series aligned with `df`.
+
+    Binary mode collapses every attack family into one Attack class, so any
+    per-class operation -- capping, rare-class removal -- has to group on the
+    collapsed target rather than the raw family. Grouping on the family in
+    binary mode would give Benign a single share of the budget while each
+    attack family took a share of its own, producing an attack-heavy training
+    set: the inverse of this dataset's ~80% benign prior.
+    """
+    lab = df[label_col].astype(str).str.strip()
+    if mode == "binary":
+        return ~lab.str.lower().isin(["benign", "normal"])
+    return lab
+
+
+def cap_by_class(df, label_col, mode, max_per_class, random_state):
+    """Subsample so no class exceeds `max_per_class`, keeping rarer ones whole.
+
+    Iterates the groups rather than using .apply: pandas 2.x drops the grouping
+    column from the frames handed to .apply.
+    """
+    parts = [g.sample(n=min(len(g), max_per_class), random_state=random_state)
+             for _, g in df.groupby(class_key(df, label_col, mode),
+                                    observed=True)]
+    return pd.concat(parts)
+
+
+def load_and_preprocess(data_dir, mode="multiclass", sample_frac=1.0,
+                        use_smote=False, random_state=42, max_per_class=None,
+                        min_class_rows=0):
+    """Load CSE-CIC-IDS2018 captures and return train/val/test splits.
+
+    Accepts the raw CIC CSVs (80 columns) and the cleaned parquet
+    redistributions (78 columns) alike. Every capture file in `data_dir` is
+    concatenated, columns that leak identity or carry no signal are dropped,
+    the infinite / missing values the raw release is notorious for are
+    repaired, the Label column is encoded, then a 60/20/20 stratified split is
+    scaled using training statistics only.
     """
     found = [os.path.join(data_dir, f) for f in sorted(os.listdir(data_dir))
              if f.lower().endswith((".csv", ".parquet", ".zip"))]
@@ -149,21 +211,36 @@ def load_and_preprocess(data_dir, mode="multiclass", sample_frac=1.0,
     frames = []
     for f in data_files:
         df = read_capture_file(f)
+        # Normalise column names here rather than after the concat: some raw
+        # CSVs ship columns with a leading space (" Flow Duration"), which
+        # would otherwise concat into a second, near-duplicate column.
+        df.columns = [c.strip() for c in df.columns]
         if sample_frac < 1.0:
             # Sample per file so no capture day (and therefore no attack
             # family) can be dropped entirely by the subsample.
             df = df.sample(frac=sample_frac, random_state=random_state)
+        if max_per_class:
+            # Pre-cap per file. The authoritative cap is applied once after the
+            # concat; this pass exists purely to bound peak memory, because a
+            # class may appear across several capture days and each day is
+            # allowed to contribute up to the full cap. Without it the entire
+            # 6.7M-row corpus has to be resident before any thinning happens.
+            lc = "Label" if "Label" in df.columns else df.columns[-1]
+            df = cap_by_class(df, lc, mode, max_per_class, random_state)
         frames.append(df)
     data = pd.concat(frames, ignore_index=True)
-
-    # Normalise column names (the CSVs ship with inconsistent spacing/case).
-    data.columns = [c.strip() for c in data.columns]
 
     # Drop columns that either leak the answer or carry no signal. Src/Dst IP
     # and Timestamp are the dangerous ones: the attacks were launched from a
     # fixed set of hosts at known times, so a model left with them learns
     # "traffic from 18.219.211.138 is bad" rather than what an attack is.
-    # Dst Port is deliberately kept -- it is genuine protocol signal.
+    #
+    # Dst Port is deliberately NOT in this list -- it is genuine protocol
+    # signal (SSH on 22, FTP on 21) and is kept whenever it is present. Note
+    # that the cleaned parquet redistributions drop both Dst Port and Timestamp
+    # upstream, so on those builds this is a no-op and the model trains without
+    # port information at all. Check the printed feature count: 77 features
+    # before constant-column removal means Dst Port is absent.
     drop_cols = [c for c in ["Timestamp", "Flow ID", "Src IP", "Dst IP",
                              "Source IP", "Destination IP", "Src Port",
                              "Source Port"] if c in data.columns]
@@ -202,18 +279,35 @@ def load_and_preprocess(data_dir, mode="multiclass", sample_frac=1.0,
     data = data.drop(columns=constant_cols, errors="ignore")
     feature_cols = [c for c in data.columns if c != label_col]
 
+    # Remove classes too small to be scored at all. Deduplicated builds of this
+    # dataset collapse several attack families to a few dozen distinct flows
+    # (FTP-BruteForce 53, DoS-SlowHTTPTest 55, SQL Injection 85), which at a
+    # 20% test split leaves ~10 test rows each. A per-class F1 computed on 10
+    # samples moves by 0.1 for every single misclassification, and because
+    # fitness() optimises the MACRO average those classes inject pure noise
+    # into the signal DE is searching on -- they do not merely make the report
+    # unreliable, they corrupt the search. Dropping them is explicit and
+    # opt-in, never silent: the counts are printed and recorded in metrics.json.
+    if min_class_rows:
+        key = class_key(data, label_col, mode)
+        counts = key.value_counts()
+        rare = counts[counts < min_class_rows]
+        if len(rare):
+            print(f"[data] dropping {len(rare)} class(es) below "
+                  f"{min_class_rows:,} rows: "
+                  f"{ {str(k): int(v) for k, v in rare.items()} }")
+            data = data[~key.isin(rare.index)]
+        del key
+
     # Class-aware cap. Unlike --sample_frac, which thins every class equally
     # and wipes out the tiny web-attack families, this keeps every row of a
     # rare class and only subsamples classes above the cap. That is what makes
     # macro-F1 meaningful while keeping the DE search affordable.
     if max_per_class:
         before = len(data)
-        # Iterate the groups rather than using .apply: pandas 2.x drops the
-        # grouping column from the frames handed to .apply.
-        parts = [g.sample(n=min(len(g), max_per_class),
-                          random_state=random_state)
-                 for _, g in data.groupby(label_col, observed=True)]
-        data = pd.concat(parts).sample(frac=1.0, random_state=random_state)
+        data = (cap_by_class(data, label_col, mode, max_per_class,
+                             random_state)
+                .sample(frac=1.0, random_state=random_state))
         print(f"[data] capped classes at {max_per_class:,}/class: "
               f"{before:,} -> {len(data):,} rows")
 
@@ -382,8 +476,24 @@ def fitness(vector, data, n_classes, epochs=20, verbose=0):
 # -----------------------------------------------------------------------------
 # 3. DIFFERENTIAL EVOLUTION (DE/rand/1/bin) - written from scratch
 # -----------------------------------------------------------------------------
+def _save_de_state(path, pop, scores, history, generation, rng):
+    """Persist the DE population after a completed generation.
+
+    The RNG's bit-generator state is saved alongside the population. Without
+    it a resumed run would reseed and replay the same mutation and crossover
+    draws it already made, which is not the search continuing -- it is a
+    different, correlated one.
+    """
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump({"pop": pop.tolist(), "scores": scores.tolist(),
+                   "history": history, "generation": generation,
+                   "rng": rng.bit_generator.state}, fh)
+    os.replace(tmp, path)          # atomic: a kill mid-write cannot corrupt it
+
+
 def differential_evolution(fitness_fn, dim=6, pop_size=20, generations=50,
-                           F=0.8, CR=0.9, seed=42):
+                           F=0.8, CR=0.9, seed=42, checkpoint=None):
     """Classic DE/rand/1/bin maximising `fitness_fn` over the unit hypercube.
 
     The search is derivative-free, which it has to be: validation macro-F1 is
@@ -391,6 +501,12 @@ def differential_evolution(fitness_fn, dim=6, pop_size=20, generations=50,
     self-adapting because the mutation vector is drawn from the population's
     own spread -- large while the population is scattered, small once it has
     converged on a region.
+
+    `checkpoint`, if given, is a path written after every generation and read
+    back on startup to resume an interrupted search. This exists for hosted
+    runtimes such as Colab, which disconnect on idle and cap session length:
+    without it a drop at generation 7 of 10 discards every training run made
+    so far. Delete the file to force a fresh search.
 
     Returns the best vector, its fitness, and the per-generation best-fitness
     history (for the convergence plot).
@@ -405,12 +521,38 @@ def differential_evolution(fitness_fn, dim=6, pop_size=20, generations=50,
             f"with 20 a reasonable compromise.")
 
     rng = np.random.default_rng(seed)
-    pop = rng.random((pop_size, dim))
-    scores = np.array([fitness_fn(ind) for ind in pop])
-    history = [float(scores.max())]
-    print(f"[DE] gen 0  best macro-F1 = {scores.max():.4f}")
+    start_gen = 1
 
-    for g in range(1, generations + 1):
+    resumed = False
+    if checkpoint and os.path.exists(checkpoint):
+        with open(checkpoint) as fh:
+            state = json.load(fh)
+        saved = np.array(state["pop"])
+        if saved.shape != (pop_size, dim):
+            # Refuse to graft a population of one shape onto a run configured
+            # for another; silently reshaping would invalidate the whole search.
+            raise ValueError(
+                f"{checkpoint} holds a {saved.shape} population but this run "
+                f"is configured for {(pop_size, dim)}. Delete the checkpoint "
+                f"to start fresh, or restore the original --pop_size.")
+        pop, scores = saved, np.array(state["scores"])
+        history, start_gen = state["history"], state["generation"] + 1
+        rng.bit_generator.state = state["rng"]
+        resumed = True
+        print(f"[DE] resumed from {checkpoint} at generation {start_gen}, "
+              f"best so far {scores.max():.4f}")
+
+    if not resumed:
+        pop = rng.random((pop_size, dim))
+        scores = np.array([fitness_fn(ind) for ind in pop])
+        history = [float(scores.max())]
+        print(f"[DE] gen 0  best macro-F1 = {scores.max():.4f}")
+        if checkpoint:
+            # Checkpoint gen 0 too: evaluating the initial population is
+            # pop_size full trainings and is just as expensive to lose.
+            _save_de_state(checkpoint, pop, scores, history, 0, rng)
+
+    for g in range(start_gen, generations + 1):
         for i in range(pop_size):
             # --- mutation: v = x_r1 + F*(x_r2 - x_r3) ---
             idxs = [j for j in range(pop_size) if j != i]
@@ -436,7 +578,9 @@ def differential_evolution(fitness_fn, dim=6, pop_size=20, generations=50,
                 scores[i] = trial_score
 
         history.append(float(scores.max()))
-        print(f"[DE] gen {g}  best macro-F1 = {scores.max():.4f}")
+        print(f"[DE] gen {g}  best macro-F1 = {scores.max():.4f}", flush=True)
+        if checkpoint:
+            _save_de_state(checkpoint, pop, scores, history, g, rng)
 
     best = int(np.argmax(scores))
     return pop[best], float(scores[best]), history
@@ -495,8 +639,16 @@ def macro_ovr_auc(y_true, proba, n_classes):
         return float("nan")
 
 
-def evaluate(model, X_test, y_test, n_classes, class_names, out_dir="results"):
-    """Score the final model on the held-out test set and save artefacts."""
+def evaluate(model, X_test, y_test, n_classes, class_names, out_dir="results",
+             sampling=None):
+    """Score the final model on the held-out test set and save artefacts.
+
+    `sampling`, when given, is recorded verbatim in metrics.json so the file
+    documents the distribution its numbers were measured on. That matters
+    because --max_per_class rebalances the test set: macro precision/recall/F1
+    weight classes equally and are unaffected, but accuracy and FPR are
+    computed over whatever mix the cap produced, not real traffic.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -515,8 +667,9 @@ def evaluate(model, X_test, y_test, n_classes, class_names, out_dir="results"):
     # `labels=` pins the matrix to n_classes x n_classes. Without it, a rare
     # class absent from BOTH y_test and y_pred silently shrinks the matrix,
     # which then mismatches class_names and raises in the heatmap and in
-    # classification_report. On a subsample of this dataset that is not
-    # hypothetical: SQL Injection has only ~87 flows in the entire corpus.
+    # classification_report. On this dataset that is not hypothetical: on the
+    # deduplicated build SQL Injection has 85 flows in the entire corpus,
+    # DoS-SlowHTTPTest 55 and FTP-BruteForce 53.
     cm = confusion_matrix(y_test, y_pred, labels=labels)
     # Macro false-positive rate, derived one-vs-rest from the matrix. This is
     # the operationally decisive metric for an IDS: at enterprise traffic
@@ -532,6 +685,23 @@ def evaluate(model, X_test, y_test, n_classes, class_names, out_dir="results"):
         f1=float(f1_score(y_test, y_pred, average="macro", zero_division=0)),
         fpr=fpr, auc=auc)
 
+    # Operational false-alarm rate: of all genuinely benign flows, the fraction
+    # the model flagged as SOME attack. This is the number the alert-fatigue
+    # argument is actually about, and `fpr` above is not it in multiclass mode:
+    # that one averages one-vs-rest FPR over every class, so a dozen easy
+    # attack classes with near-zero false positives dilute it to ~0.007 even
+    # when the model is misclassifying most benign traffic. Benign and
+    # Infiltration are near-indistinguishable in CSE-CIC-IDS2018, so that gap
+    # is wide here and reporting only the macro figure would hide it.
+    benign_idx = [i for i, c in enumerate(class_names)
+                  if str(c).strip().lower() in ("benign", "normal")]
+    if benign_idx:
+        b = benign_idx[0]
+        n_benign = int((y_test == b).sum())
+        if n_benign:
+            metrics["benign_false_alarm_rate"] = float(
+                int(((y_test == b) & (y_pred != b)).sum()) / n_benign)
+
     target_names = [str(c) for c in class_names]
     report = classification_report(y_test, y_pred, labels=labels,
                                    target_names=target_names, zero_division=0)
@@ -541,8 +711,12 @@ def evaluate(model, X_test, y_test, n_classes, class_names, out_dir="results"):
         print(f"{k:>10}: {v:.4f}")
     print(report)
 
+    payload = dict(metrics)
+    if sampling:
+        payload["_sampling"] = sampling
+        print(f"\n[note] {sampling['caveat']}")
     with open(os.path.join(out_dir, "metrics.json"), "w") as fh:
-        json.dump(metrics, fh, indent=2)
+        json.dump(payload, fh, indent=2)
     with open(os.path.join(out_dir, "classification_report.txt"), "w") as fh:
         fh.write(report)
     np.savetxt(os.path.join(out_dir, "confusion_matrix.csv"), cm,
@@ -583,7 +757,17 @@ def main():
     ap.add_argument("--max_per_class", type=int, default=None,
                     help="cap each class at N rows, keeping ALL rows of any "
                          "class smaller than N. The right knob for this "
-                         "dataset, e.g. --max_per_class 50000")
+                         "dataset, e.g. --max_per_class 50000. 'Class' follows "
+                         "--mode: attack family in multiclass, Benign/Attack "
+                         "in binary (so binary caps to at most 1:1, never "
+                         "attack-heavy)")
+    ap.add_argument("--min_class_rows", type=int, default=0,
+                    help="drop any class with fewer than N rows in the whole "
+                         "corpus. Deduplicated builds leave FTP-BruteForce, "
+                         "DoS-SlowHTTPTest and SQL Injection at ~50-85 rows, "
+                         "too few to score and pure noise in the macro-F1 that "
+                         "DE optimises. 200 removes exactly those three. "
+                         "Off by default -- dropping data is never silent")
     ap.add_argument("--use_smote", action="store_true",
                     help="oversample minority classes in the training split")
     ap.add_argument("--pop_size", type=int, default=20)
@@ -596,6 +780,13 @@ def main():
     ap.add_argument("--load_config", default=None,
                     help="skip the DE search and retrain the configuration in "
                          "this JSON file (as written to best_config.json)")
+    ap.add_argument("--checkpoint", default=None,
+                    help="path to a DE checkpoint. Written after every "
+                         "generation and resumed from if it already exists. "
+                         "Use it on Colab and other hosted runtimes, which "
+                         "disconnect on idle -- without it a drop late in the "
+                         "search discards every training run made so far. "
+                         "Delete the file to force a fresh search")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -604,7 +795,7 @@ def main():
     (X_train, y_train, X_val, y_val, X_test, y_test,
      n_classes, class_names) = load_and_preprocess(
         args.data_dir, args.mode, args.sample_frac, args.use_smote, args.seed,
-        max_per_class=args.max_per_class)
+        max_per_class=args.max_per_class, min_class_rows=args.min_class_rows)
 
     from tensorflow import keras
 
@@ -622,7 +813,7 @@ def main():
 
         best_vec, best_f1, history = differential_evolution(
             fit, pop_size=args.pop_size, generations=args.generations,
-            seed=args.seed)
+            seed=args.seed, checkpoint=args.checkpoint)
 
         best_hp = decode(best_vec)
         print(f"\n[DE] best validation macro-F1 = {best_f1:.4f}")
@@ -656,7 +847,20 @@ def main():
                     epochs=args.final_epochs, batch_size=best_hp["batch"],
                     verbose=2, callbacks=[es])
 
-    evaluate(final_model, X_test, y_test, n_classes, class_names, args.out_dir)
+    sampling = None
+    if args.max_per_class or args.min_class_rows:
+        sampling = dict(
+            max_per_class=args.max_per_class,
+            min_class_rows=args.min_class_rows or None,
+            classes_evaluated=[str(c) for c in class_names],
+            caveat="Test set was class-balanced by --max_per_class, so it does "
+                   "not carry the ~80% benign prior of real traffic. Macro "
+                   "precision/recall/F1 weight classes equally and are "
+                   "unaffected; accuracy and fpr are measured on the "
+                   "rebalanced mix and are NOT operational estimates.")
+
+    evaluate(final_model, X_test, y_test, n_classes, class_names, args.out_dir,
+             sampling=sampling)
 
     model_path = os.path.join(args.out_dir, "de_dnn_best.keras")
     final_model.save(model_path)
