@@ -1,0 +1,15 @@
+{
+  "accuracy": 0.9300,
+  "precision": 0.9519,
+  "recall": 0.8824,
+  "f1": 0.9019,
+  "fpr": 0.0066,
+  "auc": 0.9950,
+  "benign_false_alarm_rate": 0.4970,
+  "_sampling": {
+    "max_per_class": 20000,
+    "min_class_rows": 200,
+    "note": "Manually configured baseline: 2 layers x 128 neurons, lr 0.001, dropout 0.2, batch 64, ReLU. Identical pipeline, data, split and seed as the stage-one DE model.",
+    "caveat": "Test set was class-balanced by --max_per_class, so it does not carry the ~80% benign prior of real traffic. Macro precision/recall/F1 weight classes equally and are unaffected; accuracy and fpr are measured on the rebalanced mix and are NOT operational estimates."
+  }
+}

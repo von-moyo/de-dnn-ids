@@ -1,0 +1,28 @@
+{
+  "accuracy": 0.9329602458897556,
+  "precision": 0.9373865573463482,
+  "recall": 0.8988567736521423,
+  "f1": 0.9040671290317225,
+  "fpr": 0.006306150088961629,
+  "auc": 0.9956301967651582,
+  "benign_false_alarm_rate": 0.47875,
+  "_sampling": {
+    "max_per_class": 20000,
+    "min_class_rows": 200,
+    "classes_evaluated": [
+      "Benign",
+      "Bot",
+      "Brute Force -Web",
+      "Brute Force -XSS",
+      "DDOS attack-HOIC",
+      "DDOS attack-LOIC-UDP",
+      "DDoS attacks-LOIC-HTTP",
+      "DoS attacks-GoldenEye",
+      "DoS attacks-Hulk",
+      "DoS attacks-Slowloris",
+      "Infilteration",
+      "SSH-Bruteforce"
+    ],
+    "caveat": "Test set was class-balanced by --max_per_class, so it does not carry the ~80% benign prior of real traffic. Macro precision/recall/F1 weight classes equally and are unaffected; accuracy and fpr are measured on the rebalanced mix and are NOT operational estimates."
+  }
+}

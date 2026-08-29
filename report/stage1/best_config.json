@@ -1,0 +1,48 @@
+{
+  "hyperparameters": {
+    "n_layers": 4,
+    "neurons": 209,
+    "lr": 0.0007219941905611082,
+    "dropout": 0.0,
+    "batch": 128,
+    "activation": "tanh"
+  },
+  "vector": [
+    0.8449908889706326,
+    0.369388717248118,
+    0.2861779010285666,
+    0.0,
+    0.7869243775021384,
+    0.5408605191649308
+  ],
+  "validation_macro_f1": 0.9065210633080877,
+  "convergence_history": [
+    0.9039340748903005,
+    0.9039340748903005,
+    0.9039340748903005,
+    0.9051325157006183,
+    0.9065210633080877,
+    0.9065210633080877,
+    0.9065210633080877,
+    0.9065210633080877,
+    0.9065210633080877,
+    0.9065210633080877,
+    0.9065210633080877
+  ],
+  "settings": {
+    "data_dir": "./data",
+    "out_dir": "/content/drive/MyDrive/de-dnn-ids/stage1",
+    "mode": "multiclass",
+    "sample_frac": 1.0,
+    "max_per_class": 20000,
+    "min_class_rows": 200,
+    "use_smote": false,
+    "pop_size": 10,
+    "generations": 10,
+    "fitness_epochs": 8,
+    "final_epochs": 100,
+    "seed": 42,
+    "load_config": null,
+    "checkpoint": "/content/drive/MyDrive/de-dnn-ids/de_checkpoint.json"
+  }
+}

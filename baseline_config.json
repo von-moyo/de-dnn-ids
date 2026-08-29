@@ -1,0 +1,16 @@
+{
+  "_comment": "Manually configured baseline for Chapter 4 comparison. These are conventional hand-picked defaults a practitioner would reach for without running any search: a shallow two-layer network, Adam's usual 1e-3 learning rate, moderate dropout, and the batch size and activation that dominate the IDS literature. Run through the SAME pipeline and the SAME data flags as the DE run so the only difference is where the hyperparameters came from.",
+  "hyperparameters": {
+    "n_layers": 2,
+    "neurons": 128,
+    "lr": 0.001,
+    "dropout": 0.2,
+    "batch": 64,
+    "activation": "relu"
+  },
+  "validation_macro_f1": null,
+  "convergence_history": [],
+  "settings": {
+    "note": "not produced by a DE search; hyperparameters chosen by hand"
+  }
+}

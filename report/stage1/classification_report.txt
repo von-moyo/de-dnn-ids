@@ -1,0 +1,18 @@
+                        precision    recall  f1-score   support
+
+                Benign       0.88      0.52      0.66      4000
+                   Bot       1.00      0.99      1.00      4000
+      Brute Force -Web       0.74      0.89      0.80       114
+      Brute Force -XSS       1.00      0.48      0.65        46
+      DDOS attack-HOIC       1.00      1.00      1.00      4000
+  DDOS attack-LOIC-UDP       0.99      0.99      0.99       346
+DDoS attacks-LOIC-HTTP       0.99      1.00      0.99      4000
+ DoS attacks-GoldenEye       1.00      1.00      1.00      4000
+      DoS attacks-Hulk       1.00      1.00      1.00      4000
+ DoS attacks-Slowloris       1.00      1.00      1.00      1981
+         Infilteration       0.66      0.93      0.77      4000
+        SSH-Bruteforce       1.00      1.00      1.00      4000
+
+              accuracy                           0.93     34487
+             macro avg       0.94      0.90      0.90     34487
+          weighted avg       0.94      0.93      0.93     34487

@@ -586,6 +586,45 @@ def differential_evolution(fitness_fn, dim=6, pop_size=20, generations=50,
     return pop[best], float(scores[best]), history
 
 
+def plot_training_loss(history, out_dir="results"):
+    """Save the final model's training/validation loss curve.
+
+    The gap between the two curves is the overfitting diagnostic, and the epoch
+    at which validation loss bottoms out is the one early stopping restores --
+    both are worth having on paper rather than only in console scrollback.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    loss, val = history.get("loss", []), history.get("val_loss", [])
+    if not loss:
+        return
+    ep = range(1, len(loss) + 1)
+    plt.figure(figsize=(7, 4.5))
+    plt.plot(ep, loss, marker="o", markersize=3, linewidth=1.6,
+             color="#1f4e79", label="Training loss")
+    if val:
+        plt.plot(ep, val, marker="s", markersize=3, linewidth=1.6,
+                 color="#c00000", label="Validation loss")
+        best = int(np.argmin(val)) + 1
+        plt.axvline(best, linestyle="--", linewidth=1.1, color="grey")
+        plt.annotate(f"best validation loss (epoch {best}, {min(val):.4f})",
+                     xy=(best, min(val)), xytext=(best + 2, max(loss) * 0.8),
+                     fontsize=8, arrowprops=dict(arrowstyle="->", linewidth=0.8,
+                                                 color="grey"))
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training and Validation Loss of the Final Model")
+    plt.legend(frameon=False)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    path = os.path.join(out_dir, "training_loss.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"[out] training loss curve -> {path}")
+
+
 def plot_convergence(history, out_dir="results"):
     """Save the DE convergence curve (best macro-F1 per generation)."""
     import matplotlib
@@ -842,10 +881,19 @@ def main():
     final_model.summary()
     es = keras.callbacks.EarlyStopping(monitor="val_loss", patience=10,
                                        restore_best_weights=True)
-    final_model.fit(X_fit, y_fit,
-                    validation_data=(X_es, y_es),
-                    epochs=args.final_epochs, batch_size=best_hp["batch"],
-                    verbose=2, callbacks=[es])
+    hist = final_model.fit(X_fit, y_fit,
+                           validation_data=(X_es, y_es),
+                           epochs=args.final_epochs,
+                           batch_size=best_hp["batch"],
+                           verbose=2, callbacks=[es])
+
+    # Persist and plot the learning curve. Without this the only record of how
+    # the final model trained is console scrollback, which cannot be put in a
+    # report or checked afterwards.
+    with open(os.path.join(args.out_dir, "training_history.json"), "w") as fh:
+        json.dump({k: [float(x) for x in v] for k, v in hist.history.items()},
+                  fh, indent=2)
+    plot_training_loss(hist.history, args.out_dir)
 
     sampling = None
     if args.max_per_class or args.min_class_rows:
