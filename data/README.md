@@ -42,9 +42,6 @@ pip install kaggle          # token at ~/.kaggle/kaggle.json
 kaggle datasets download -d dhoogla/csecicids2018 -p ./data --unzip
 ```
 
-You do not need all ten files. The pipeline concatenates whatever it finds and
-derives the class list from the labels present — but a missing day means a
-missing attack family, so partial coverage must be stated in your results.
 
 ## The files
 
