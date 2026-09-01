@@ -158,6 +158,33 @@ The pipeline now prints per-class test support before training and flags any
 class with fewer than 30 test flows, so this is visible up front rather than as a
 failure at the reporting stage.
 
+#### The search surface is flatter than the measurement noise
+
+On the stage-1 run (`--max_per_class 20000`, 12 scoreable classes) the DE winner
+reached macro-F1 **0.9041** against a hand-tuned baseline's **0.9019** — a gap of
+**0.0022**. Four things make that number hard to take at face value:
+
+- **8 of the 12 classes already sit at F1 ≥ 0.99** (Bot, HOIC, LOIC-UDP,
+  LOIC-HTTP, GoldenEye, Hulk, Slowloris, SSH-Bruteforce). Two-thirds of macro-F1
+  is frozen and no hyperparameter moves it; the entire searchable range lives in
+  Benign (0.66), Infiltration (0.77), Brute Force -Web (0.80) and -XSS (0.65).
+- **Brute Force -XSS has 46 test rows.** One row landing differently shifts its
+  F1 by 0.018 and macro-F1 by **0.0015** — most of the gap being argued over.
+- **The best of the random initial population already beat the baseline**
+  (0.90393 vs 0.9019 on validation, before DE had done anything). DE then added
+  0.0026 and plateaued from generation 4, spending 60 evaluations for nothing.
+- **Two very different architectures land in the same place**: 2×128/ReLU/
+  dropout 0.2/lr 1e-3/batch 64 versus 4×209/tanh/dropout 0.0/lr 7.2e-4/batch 128,
+  0.24% apart. That is the signature of a flat surface, not a failed search.
+
+`seed_variance.py` is the instrument for this: it retrains one configuration
+several times and reports the run-to-run spread, so a gap can be judged against
+the noise it has to clear. Run it before concluding anything from a comparison,
+and quote the spread alongside the gap. A negative result here — "DE matched
+hand-tuning because Benign↔Infiltration label collisions cap achievable macro-F1
+regardless of architecture" — is a real finding, and more honest than the large
+unqualified gains usually reported in this literature.
+
 ---
 
 ## Dataset build matters
@@ -257,23 +284,43 @@ python de_dnn_ids.py --use_smote
 `--pop_size 4` is the floor: DE/rand/1 needs three donor vectors distinct from
 the target, so a smaller population cannot form a mutation at all.
 
-### Recommended two-stage protocol
+### Recommended protocol
 
 The default budget is `pop_size × (1 + generations) = 1,020` full network
 trainings — days of compute on CPU, and not feasible at any realistic data size.
 Search cheaply, then retrain the winner larger:
 
 ```bash
-# Stage 1 — search on a class-capped subset (5–8 h on CPU)
+# Stage 0 — noise floor. How large a difference can the experiment resolve?
+python seed_variance.py --seeds 5 --epochs 100 \
+    --config results/stage1/best_config.json \
+    --config baseline_config.json \
+    --out_dir results/variance \
+    --max_per_class 20000 --min_class_rows 200
+
+# Stage 1 — search on a class-capped subset
 python de_dnn_ids.py --out_dir results/stage1 \
     --max_per_class 20000 --min_class_rows 200 \
-    --pop_size 10 --generations 10 --fitness_epochs 8
+    --pop_size 20 --generations 12 --fitness_epochs 25
 
 # Stage 2 — retrain the winning configuration once, on 10× the data (1–2 h)
 python de_dnn_ids.py --out_dir results/final \
     --max_per_class 200000 --min_class_rows 200 \
     --load_config results/stage1/best_config.json
 ```
+
+**Do stage 0 first.** It is ten trainings and it decides whether the rest is
+worth running. If macro-F1 moves as much between two identical runs as it does
+between the DE winner and the baseline, then the comparison cannot support any
+claim, and a larger `--pop_size` only makes the search chase differences the
+measurement cannot see. See [Reading these results
+honestly](#reading-these-results-honestly).
+
+Keep `--fitness_epochs` within reach of `--final_epochs`. `fitness()` stops
+early on patience 5; a cap far below the final budget means the cap ends every
+candidate instead, so DE ranks on *"best after N epochs"* rather than *"best
+when trained out"* — which systematically favours fast-starting configurations
+(high learning rate, small batch) over ones that win given the full budget.
 
 This is a standard **fidelity-reduction** strategy: DE converges on the *relative
 ranking* of hyperparameters, and that ranking is largely stable across sample
@@ -296,7 +343,8 @@ sizes even though absolute scores are not.
 | `--use_smote` | off | Oversample minority classes in the training split |
 | `--pop_size` | `20` | DE population size |
 | `--generations` | `50` | DE generations |
-| `--fitness_epochs` | `20` | Epoch budget per DE candidate |
+| `--fitness_epochs` | `20` | Epoch budget per DE candidate. Early stopping normally ends the fit first; set this far below `--final_epochs` and the cap bites instead, changing what DE optimises |
+| `--fitness_repeats` | `1` | Train each candidate N times and average the macro-F1. Costs N×, cuts fitness noise by √N. Only worth it if `seed_variance.py` shows run-to-run spread near the gap between candidates |
 | `--final_epochs` | `100` | Epoch budget for the retrained winner |
 | `--seed` | `42` | Seeds Python, NumPy, TensorFlow and all splits |
 | `--load_config` | — | Skip the search; retrain a saved `best_config.json` |
@@ -405,9 +453,13 @@ global graph accumulating across ~1,000 evaluations.
 ```
 de-dnn-ids/
 ├── de_dnn_ids.py          # Complete pipeline: preprocessing, DNN, DE, evaluation
+├── seed_variance.py       # Run-to-run spread: what gap can this experiment resolve?
+├── baseline_config.json   # Hand-picked hyperparameters, for the comparison
+├── colab_de_dnn_ids.ipynb # End-to-end run on a free Colab T4, no credentials
 ├── requirements.txt
 ├── data/
 │   └── README.md          # How to obtain CSE-CIC-IDS2018 + its known defects
+├── report/                # Measured artefacts: stage1/, final/, baseline/
 ├── results/               # Run artefacts (git-ignored except the CSV matrix)
 ├── docs/images/           # Figures used in this README
 ├── CITATION.cff

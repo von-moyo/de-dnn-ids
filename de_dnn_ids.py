@@ -438,13 +438,28 @@ def build_dnn(input_dim, n_classes, hp):
     return model
 
 
-def fitness(vector, data, n_classes, epochs=20, verbose=0):
+def fitness(vector, data, n_classes, epochs=20, verbose=0, repeats=1, seed=42):
     """Train a candidate DNN and return validation macro-F1 (to maximise).
 
     Macro-F1 weights every class equally, so a rare attack family such as
     Infiltration counts as much as DDoS. Optimising accuracy instead would
     reward a model that predicts "Benign" for everything, since ~83% of the
     dataset is benign.
+
+    `epochs` is a budget rather than a target: EarlyStopping with patience 5
+    restores the best weights once validation loss stops improving. Setting it
+    far below --final_epochs changes what is being optimised. DE then ranks
+    candidates on "best after `epochs`" instead of "best when trained out",
+    which quietly favours fast-starting configurations -- high learning rate,
+    small batch -- over ones that win given the full budget. Keep it close
+    enough to --final_epochs that early stopping, not the cap, ends most fits.
+
+    `repeats` trains the same candidate several times from different weight
+    initialisations and averages the scores. A single fit's macro-F1 moves run
+    to run; where that movement is the same size as the gap between two
+    candidates, greedy selection is choosing on noise rather than on merit.
+    Averaging shrinks the standard error by sqrt(repeats), at `repeats` times
+    the cost. Measure the spread with seed_variance.py before paying for it.
 
     A candidate that fails to train (typically an out-of-memory configuration)
     scores 0.0 rather than aborting the search, so a multi-hour run is not lost
@@ -453,24 +468,35 @@ def fitness(vector, data, n_classes, epochs=20, verbose=0):
     from tensorflow import keras
     X_train, y_train, X_val, y_val = data
     hp = decode(vector)
-    try:
-        keras.backend.clear_session()
-        model = build_dnn(X_train.shape[1], n_classes, hp)
-        es = keras.callbacks.EarlyStopping(monitor="val_loss", patience=5,
-                                           restore_best_weights=True)
-        model.fit(X_train, y_train, validation_data=(X_val, y_val),
-                  epochs=epochs, batch_size=hp["batch"], verbose=verbose,
-                  callbacks=[es])
+    scores = []
+    for r in range(repeats):
+        try:
+            # Every candidate starts from the same RNG state, so two of them
+            # differ by their hyperparameters and not by the draw they happened
+            # to get -- the common-random-numbers trick, which removes a chunk
+            # of the noise DE would otherwise select on. Note this reseeds the
+            # global RNGs only: DE holds its own Generator, so its mutation and
+            # crossover draws are untouched. It does mean fitness scores are no
+            # longer comparable with runs made before this was added.
+            set_seeds(seed + r)
+            keras.backend.clear_session()
+            model = build_dnn(X_train.shape[1], n_classes, hp)
+            es = keras.callbacks.EarlyStopping(monitor="val_loss", patience=5,
+                                               restore_best_weights=True)
+            model.fit(X_train, y_train, validation_data=(X_val, y_val),
+                      epochs=epochs, batch_size=hp["batch"], verbose=verbose,
+                      callbacks=[es])
 
-        if n_classes == 2:
-            y_pred = (model.predict(X_val, verbose=0).ravel() >= 0.5).astype(int)
-        else:
-            y_pred = np.argmax(model.predict(X_val, verbose=0), axis=1)
-        return float(f1_score(y_val, y_pred, average="macro"))
-    except Exception as e:
-        print(f"[warn] candidate {hp} failed ({type(e).__name__}: {e}); "
-              f"scoring 0.0")
-        return 0.0
+            if n_classes == 2:
+                y_pred = (model.predict(X_val, verbose=0).ravel() >= 0.5).astype(int)
+            else:
+                y_pred = np.argmax(model.predict(X_val, verbose=0), axis=1)
+            scores.append(float(f1_score(y_val, y_pred, average="macro")))
+        except Exception as e:
+            print(f"[warn] candidate {hp} failed ({type(e).__name__}: {e}); "
+                  f"scoring 0.0")
+            scores.append(0.0)
+    return float(np.mean(scores))
 
 
 # -----------------------------------------------------------------------------
@@ -812,7 +838,18 @@ def main():
     ap.add_argument("--pop_size", type=int, default=20)
     ap.add_argument("--generations", type=int, default=50)
     ap.add_argument("--fitness_epochs", type=int, default=20,
-                    help="epoch budget per DE candidate")
+                    help="epoch budget per DE candidate. Early stopping ends "
+                         "most fits before this; the cap only matters when it "
+                         "bites first. Setting it far below --final_epochs "
+                         "makes DE optimise 'best after N epochs', which is "
+                         "not the objective the final model is judged on")
+    ap.add_argument("--fitness_repeats", type=int, default=1,
+                    help="train each DE candidate N times from different "
+                         "weight initialisations and average the macro-F1. "
+                         "Costs N times as much and shrinks the noise in the "
+                         "fitness by sqrt(N). Worth it only when run-to-run "
+                         "spread is comparable to the gap between candidates "
+                         "-- run seed_variance.py first to find out")
     ap.add_argument("--final_epochs", type=int, default=100,
                     help="epoch budget for the retrained winner")
     ap.add_argument("--seed", type=int, default=42)
@@ -847,8 +884,19 @@ def main():
     else:
         de_data = (X_train, y_train, X_val, y_val)
 
+        # A search budget far below the final budget optimises a different
+        # objective than the one the winner is later judged on. Say so rather
+        # than letting it pass silently into the results.
+        if args.fitness_epochs < 0.2 * args.final_epochs:
+            print(f"[warn] --fitness_epochs {args.fitness_epochs} is small "
+                  f"against --final_epochs {args.final_epochs}. DE will rank "
+                  f"candidates on how they look after "
+                  f"{args.fitness_epochs} epochs, which favours fast-starting "
+                  f"configurations over ones that are better fully trained.")
+
         def fit(v):
-            return fitness(v, de_data, n_classes, epochs=args.fitness_epochs)
+            return fitness(v, de_data, n_classes, epochs=args.fitness_epochs,
+                           repeats=args.fitness_repeats, seed=args.seed)
 
         best_vec, best_f1, history = differential_evolution(
             fit, pop_size=args.pop_size, generations=args.generations,
