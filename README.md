@@ -158,32 +158,51 @@ The pipeline now prints per-class test support before training and flags any
 class with fewer than 30 test flows, so this is visible up front rather than as a
 failure at the reporting stage.
 
-#### The search surface is flatter than the measurement noise
+#### What the search is worth, measured
 
-On the stage-1 run (`--max_per_class 20000`, 12 scoreable classes) the DE winner
-reached macro-F1 **0.9041** against a hand-tuned baseline's **0.9019** — a gap of
-**0.0022**. Four things make that number hard to take at face value:
+A single run cannot answer this. On stage 1 (`--max_per_class 20000`, 12
+scoreable classes) the DE winner scored macro-F1 **0.9041** against a hand-tuned
+baseline's **0.9019** — a gap of 0.0022 that looks like nothing at all.
+Retraining both five times with different weight initialisations at a fixed data
+split (`seed_variance.py`, 100-epoch budget) says otherwise:
+
+| Configuration | mean macro-F1 | sd | range |
+|---|---|---|---|
+| **DE winner** — 4×209, tanh, dropout 0.0, lr 7.2e-4, batch 128 | **0.9060** | 0.0058 | 0.8960 – 0.9098 |
+| **Hand-tuned** — 2×128, ReLU, dropout 0.2, lr 1e-3, batch 64 | 0.8876 | 0.0106 | 0.8775 – 0.9032 |
+
+Gap **+0.0184**, pooled sd 0.0085, Welch *t* = 3.40, **p = 0.014**. The
+difference clears the noise.
+
+The single-run comparison understated it badly, and in the direction that
+flatters the baseline: **0.9019 was a lucky draw**, essentially the top of that
+configuration's own range (max 0.9032), while its typical run is 0.8876. Measure
+the spread before quoting any gap — it can mislead in either direction.
+
+Three things to keep in view when reading the number:
 
 - **8 of the 12 classes already sit at F1 ≥ 0.99** (Bot, HOIC, LOIC-UDP,
   LOIC-HTTP, GoldenEye, Hulk, Slowloris, SSH-Bruteforce). Two-thirds of macro-F1
   is frozen and no hyperparameter moves it; the entire searchable range lives in
   Benign (0.66), Infiltration (0.77), Brute Force -Web (0.80) and -XSS (0.65).
+  Whatever DE won, it won inside that third.
 - **Brute Force -XSS has 46 test rows.** One row landing differently shifts its
-  F1 by 0.018 and macro-F1 by **0.0015** — most of the gap being argued over.
-- **The best of the random initial population already beat the baseline**
-  (0.90393 vs 0.9019 on validation, before DE had done anything). DE then added
-  0.0026 and plateaued from generation 4, spending 60 evaluations for nothing.
-- **Two very different architectures land in the same place**: 2×128/ReLU/
-  dropout 0.2/lr 1e-3/batch 64 versus 4×209/tanh/dropout 0.0/lr 7.2e-4/batch 128,
-  0.24% apart. That is the signature of a flat surface, not a failed search.
+  F1 by 0.018 and macro-F1 by 0.0015 — small against a 0.0184 gap, but it is
+  why the five runs spread as far as they do.
+- **Early stopping may be handicapping the baseline.** It stops on `val_loss`
+  with patience 10, and the baseline halted at epoch 11 in four of five runs —
+  meaning its best epoch was 1 and `restore_best_weights` discarded the rest.
+  The DE winner trained 25–44 epochs; the single baseline run that reached 20
+  scored that configuration's best result. Part of what DE selected for may be
+  "trains stably under val_loss early stopping" rather than raw capacity. That
+  is still a real property of the found configuration, but it is a narrower
+  claim than "better architecture", and worth stating rather than glossing.
 
-`seed_variance.py` is the instrument for this: it retrains one configuration
-several times and reports the run-to-run spread, so a gap can be judged against
-the noise it has to clear. Run it before concluding anything from a comparison,
-and quote the spread alongside the gap. A negative result here — "DE matched
-hand-tuning because Benign↔Infiltration label collisions cap achievable macro-F1
-regardless of architecture" — is a real finding, and more honest than the large
-unqualified gains usually reported in this literature.
+`seed_variance.py` is the instrument for all of this: it retrains one
+configuration several times, reports the run-to-run spread, and judges a gap
+against it with both the 2σ rule and a Welch *t*-test. Quote the spread
+alongside the gap. Most published DE-for-IDS comparisons report a single run per
+configuration and cannot distinguish a real improvement from a fortunate seed.
 
 ---
 
