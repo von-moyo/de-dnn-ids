@@ -35,12 +35,18 @@ aws s3 sync --no-sign-request --region eu-west-3 \
 
 Also mirrored on Kaggle as `solarmainframe/ids-intrusion-csv`.
 
-**Cleaned parquet redistribution** — `dhoogla/csecicids2018`:
+**Cleaned parquet redistribution** — `dhoogla/csecicids2018`. This is the
+build every number in the writeup was measured on. Kaggle serves public
+datasets anonymously, so no account, API token or `kaggle.json` is needed:
 
 ```bash
-pip install kaggle          # token at ~/.kaggle/kaggle.json
-kaggle datasets download -d dhoogla/csecicids2018 -p ./data --unzip
+curl -L -C - -o data/csecicids2018.zip \
+    https://www.kaggle.com/api/v1/datasets/download/dhoogla/csecicids2018
+unzip -o data/csecicids2018.zip -d data && rm data/csecicids2018.zip
 ```
+
+The archive is 634 MB. `-C -` resumes a partial file, so an interrupted
+download costs only the remainder — re-run the same command.
 
 You do not need all ten files. The pipeline concatenates whatever it finds and
 derives the class list from the labels present — but a missing day means a

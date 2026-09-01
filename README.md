@@ -223,6 +223,18 @@ Then fetch the dataset into `data/` — see [`data/README.md`](data/README.md).
 > WSL2, `tensorflow-directml-plugin`, or Google Colab (Runtime → Change runtime
 > type → GPU). On CPU the full search is not practical.
 
+### Running it on Colab
+
+[`colab_de_dnn_ids.ipynb`](colab_de_dnn_ids.ipynb) reproduces the whole study on
+a free T4. Open it in Colab, set the runtime to GPU, and run the cells in order.
+
+Nothing has to be set up beforehand: it clones this repo, downloads the dataset
+from Kaggle's anonymous public endpoint, and runs both stages. There is no
+Kaggle account, API token or `kaggle.json` involved, and no dataset to upload.
+The Google Drive mount in section 5 is the only sign-in in the notebook, and it
+is optional — set `USE_DRIVE = False` to keep results on local disk, at the cost
+of being unable to resume the search after a Colab disconnect.
+
 ---
 
 ## Usage
