@@ -303,4 +303,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Nothing is written until every run has finished, so an interrupt
+        # here costs the whole comparison rather than part of it.
+        print("\n[stopped] Interrupted before all runs completed; "
+              "no results were written. Re-run from the start.")
+        raise SystemExit(130)

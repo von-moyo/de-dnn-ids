@@ -964,4 +964,17 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Stopping a multi-hour search is routine on a hosted runtime with a
+        # session cap, so it should report state rather than dump a stack
+        # trace through whatever Keras happened to be doing at the time.
+        print("\n[stopped] Interrupted.")
+        print("[stopped] With --checkpoint set, the last COMPLETED generation "
+              "is on disk and re-running the same command resumes from it. "
+              "Work done part-way through the current generation is lost -- "
+              "the population is only consistent at a generation boundary.")
+        print("[stopped] To turn an unfinished search into a usable "
+              "best_config.json, run harvest_checkpoint.py.")
+        raise SystemExit(130)      # 128 + SIGINT, the usual convention
